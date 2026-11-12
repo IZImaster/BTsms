@@ -21,6 +21,9 @@
   button.primary { background:var(--blue); color:#fff; border-color:var(--blue); }
   button.primary:hover { background:#1765cc; }
   button:disabled { opacity:.5; cursor:default; }
+  button.find { border-color:#f9ab00; font-weight:600; }
+  button.find.ringing { background:#d93025; border-color:#d93025; color:#fff; animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity:.6; } }
   main { max-width:1200px; margin:0 auto; padding:20px; }
   .composer { max-width:600px; margin:0 auto 24px; background:#fff; border:1px solid var(--border);
               border-radius:10px; box-shadow:0 1px 3px rgba(0,0,0,.12); padding:10px 12px; }
@@ -57,6 +60,7 @@
   <h1>BTsms</h1>
   <div class="status"><span id="dot" class="dot"></span><span id="statusText">Not connected</span></div>
   <div class="spacer"></div>
+  <button id="findBtn" class="find" hidden>🔊 Find TC52</button>
   <button id="connectBtn" class="primary">Connect to TC52</button>
   <button id="disconnectBtn" hidden>Disconnect</button>
 </header>
@@ -111,6 +115,8 @@ function updateButtons() {
   $('connectBtn').hidden = c;
   $('disconnectBtn').hidden = !c;
   $('addBtn').disabled = !c;
+  $('findBtn').hidden = !c;
+  if (!c) setAlarm(false);
   document.body.classList.toggle('offline', !c);
 }
 function colorFor(id) {
@@ -240,8 +246,10 @@ function onPacket(ev) {
   const json = dec.decode(new Uint8Array(inBuf));
   inBuf = [];
   let msg; try { msg = JSON.parse(json); } catch (e) { return; }
+  if (msg.t === 'alarm') { setAlarm(!!msg.on); return; }
   if (msg.t === 'notes') {
     if (msg.mtu) chunk = Math.max(19, Math.min(msg.mtu - 3, 500) - 1);
+    setAlarm(!!msg.alarm);
     notes = msg.notes || [];
     saveCache();
     render();
@@ -265,6 +273,16 @@ function send(obj) {
   }).catch(e => toast('Send failed: ' + e.message));
   return writeChain;
 }
+
+// ---------- find device
+let alarmOn = false;
+function setAlarm(on) {
+  alarmOn = on;
+  const b = $('findBtn');
+  b.textContent = on ? '🔕 Stop alarm' : '🔊 Find TC52';
+  b.classList.toggle('ringing', on);
+}
+$('findBtn').onclick = () => send({ t: alarmOn ? 'stopfind' : 'find' });
 
 // ---------- UI wiring
 $('connectBtn').onclick = connect;

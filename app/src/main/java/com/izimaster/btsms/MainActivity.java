@@ -30,7 +30,7 @@ import android.widget.Toast;
 import java.util.ArrayList;
 import java.util.List;
 
-public class MainActivity extends Activity implements NoteStore.Listener, BleService.StatusListener {
+public class MainActivity extends Activity implements NoteStore.Listener, BleService.StatusListener, Alarm.Listener {
 
     private static final int[] CARD_COLORS = {
             0xFFFFF8B8, 0xFFE2F6D3, 0xFFD4E4ED, 0xFFF6E2DD, 0xFFE9E3D4, 0xFFEFEFF1, 0xFFFAAFA8, 0xFFB4DDD3
@@ -41,6 +41,7 @@ public class MainActivity extends Activity implements NoteStore.Listener, BleSer
     private TextView statusView;
     private Button startStop;
     private EditText input;
+    private Button stopAlarm;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -56,13 +57,16 @@ public class MainActivity extends Activity implements NoteStore.Listener, BleSer
         super.onResume();
         store.addListener(this);
         BleService.setStatusListener(this);
+        Alarm.addListener(this);
         onStatus(BleService.getStatus());
+        onAlarmChanged(Alarm.isRinging());
         render();
     }
 
     @Override
     protected void onPause() {
         store.removeListener(this);
+        Alarm.removeListener(this);
         BleService.setStatusListener(null);
         super.onPause();
     }
@@ -140,6 +144,21 @@ public class MainActivity extends Activity implements NoteStore.Listener, BleSer
         });
         top.addView(startStop);
         root.addView(top);
+
+        stopAlarm = new Button(this);
+        stopAlarm.setText("STOP ALARM");
+        stopAlarm.setTextSize(22);
+        stopAlarm.setTextColor(Color.WHITE);
+        stopAlarm.setTypeface(Typeface.DEFAULT_BOLD);
+        GradientDrawable red = new GradientDrawable();
+        red.setColor(0xFFD93025);
+        red.setCornerRadius(dp(12));
+        stopAlarm.setBackground(red);
+        stopAlarm.setVisibility(View.GONE);
+        stopAlarm.setOnClickListener(v -> Alarm.stop());
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(90));
+        slp.setMargins(0, dp(8), 0, dp(8));
+        root.addView(stopAlarm, slp);
 
         statusView = new TextView(this);
         statusView.setTextSize(14);
@@ -273,6 +292,11 @@ public class MainActivity extends Activity implements NoteStore.Listener, BleSer
     }
 
     // ------------------------------------------------------------ listeners
+
+    @Override
+    public void onAlarmChanged(boolean ringing) {
+        if (stopAlarm != null) stopAlarm.setVisibility(ringing ? View.VISIBLE : View.GONE);
+    }
 
     @Override
     public void onNotesChanged() {

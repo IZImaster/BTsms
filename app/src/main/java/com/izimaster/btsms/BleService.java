@@ -116,6 +116,7 @@ public class BleService extends Service implements NoteStore.Listener {
         running = true;
         store = NoteStore.get(this);
         store.addListener(this);
+        Alarm.addListener(alarmListener);
         manager = (BluetoothManager) getSystemService(Context.BLUETOOTH_SERVICE);
         startInForeground();
         registerReceiver(btStateReceiver, new IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED));
@@ -124,6 +125,7 @@ public class BleService extends Service implements NoteStore.Listener {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        if (intent != null && Alarm.ACTION_STOP.equals(intent.getAction())) Alarm.stop();
         return START_STICKY;
     }
 
@@ -131,6 +133,8 @@ public class BleService extends Service implements NoteStore.Listener {
     public void onDestroy() {
         running = false;
         store.removeListener(this);
+        Alarm.removeListener(alarmListener);
+        Alarm.stop();
         try { unregisterReceiver(btStateReceiver); } catch (Exception ignored) { }
         stopBle();
         setStatus("Stopped");
@@ -396,6 +400,12 @@ public class BleService extends Service implements NoteStore.Listener {
                 case "del":
                     store.delete(msg.optString("id"));
                     break;
+                case "find":
+                    Alarm.start(this);
+                    break;
+                case "stopfind":
+                    Alarm.stop();
+                    break;
                 default:
                     break;
             }
@@ -421,23 +431,42 @@ public class BleService extends Service implements NoteStore.Listener {
             JSONObject msg = new JSONObject();
             msg.put("t", "notes");
             msg.put("mtu", c.mtu);
+            msg.put("alarm", Alarm.isRinging());
             msg.put("notes", store.toJson());
-            byte[] bytes = msg.toString().getBytes(StandardCharsets.UTF_8);
-            // drop older, not yet sent note lists for this device - only the newest matters
-            queue.removeIf(p -> p.device.getAddress().equals(device.getAddress()));
-            int chunk = Math.max(19, Math.min(c.mtu - 3, 500) - 1);
-            for (int pos = 0; pos < bytes.length || pos == 0; pos += chunk) {
-                int len = Math.min(chunk, bytes.length - pos);
-                byte[] p = new byte[len + 1];
-                p[0] = (byte) (pos + len >= bytes.length ? 0 : 1);
-                System.arraycopy(bytes, pos, p, 1, len);
-                queue.add(new Packet(device, p));
-                if (pos + len >= bytes.length) break;
-            }
-            sendNext();
+            sendJson(device, msg);
         } catch (Exception ignored) {
         }
     }
+
+    private void sendAlarmState(boolean on) {
+        for (Map.Entry<String, Client> e : clients.entrySet()) {
+            if (!e.getValue().subscribed) continue;
+            BluetoothDevice d = devices.get(e.getKey());
+            if (d == null) continue;
+            try {
+                JSONObject msg = new JSONObject();
+                msg.put("t", "alarm");
+                msg.put("on", on);
+                sendJson(d, msg);
+            } catch (Exception ignored) { }
+        }
+    }
+
+    private void sendJson(BluetoothDevice device, JSONObject msg) {
+        Client c = client(device);
+        byte[] bytes = msg.toString().getBytes(StandardCharsets.UTF_8);
+        int chunk = Math.max(19, Math.min(c.mtu - 3, 500) - 1);
+        for (int pos = 0; pos < bytes.length; pos += chunk) {
+            int len = Math.min(chunk, bytes.length - pos);
+            byte[] p = new byte[len + 1];
+            p[0] = (byte) (pos + len >= bytes.length ? 0 : 1);
+            System.arraycopy(bytes, pos, p, 1, len);
+            queue.add(new Packet(device, p));
+        }
+        sendNext();
+    }
+
+    private final Alarm.Listener alarmListener = this::sendAlarmState;
 
     @SuppressWarnings("deprecation")
     private void sendNext() {
