@@ -338,7 +338,7 @@ let currentRssi = null;
 let watchAbort = null;
 function stopSignalWatch() {
   try { if (watchAbort) watchAbort.abort(); } catch (e) {}
-  watchAbort = null; watching = false; samples = []; currentRssi = null; lastAdvert = 0; weakSince = null;
+  watchAbort = null; watching = false; tc52Rssi = false; samples = []; currentRssi = null; lastAdvert = 0; weakSince = null;
   showSignal(); $('rssiText').textContent = 'Signal: –';
 }
 
@@ -365,27 +365,29 @@ $('useCurrent').onclick = () => {
 
 async function startSignalWatch() {
   if (watching) return;
-  if (!device.watchAdvertisements) {
-    $('sigHint').textContent = 'Signal strength needs a Chrome setting: open chrome://flags/#enable-experimental-web-platform-features, set it to Enabled, click Relaunch, then Connect again. ' +
-                               '(The alarm still works when the connection fully drops.)';
-    return;
-  }
+  if (!device.watchAdvertisements) return; // fine: the TC52 app measures the signal itself
   try {
     if (!device._btsmsListener) { device.addEventListener('advertisementreceived', onAdvert); device._btsmsListener = true; }
     watchAbort = new AbortController();
     await device.watchAdvertisements({ signal: watchAbort.signal });
     watching = true;
     $('sigHint').textContent = '';
-  } catch (e) {
-    $('sigHint').textContent = 'Could not measure signal: ' + e.message;
-  }
+  } catch (e) { /* not available - TC52 measurements are used instead */ }
+  setTimeout(() => {
+    if (connected() && !lastAdvert) $('sigHint').textContent =
+      'No signal reading yet. Make sure the TC52 has the latest BTsms app installed (update it from the link at the bottom of this page).';
+  }, 10000);
 }
 
+let tc52Rssi = false;   // TC52 is sending its own measurements (preferred)
 function onAdvert(ev) {
-  if (typeof ev.rssi !== 'number') return;
+  if (typeof ev.rssi !== 'number' || tc52Rssi) return;
+  addSample(ev.rssi, 'chrome');
+}
+function addSample(rssi, source) {
   const now = Date.now();
   lastAdvert = now;
-  samples.push([now, ev.rssi]);
+  samples.push([now, rssi]);
   samples = samples.filter(s => now - s[0] <= 3000);
   currentRssi = Math.round(samples.reduce((a, s) => a + s[1], 0) / samples.length);
   showSignal();
@@ -437,6 +439,7 @@ function onPacket(ev) {
   inBuf = [];
   let msg; try { msg = JSON.parse(json); } catch (e) { return; }
   if (msg.t === 'alarm') { setAlarm(!!msg.on); return; }
+  if (msg.t === 'rssi') { tc52Rssi = true; watching = true; $('sigHint').textContent = ''; addSample(msg.v, 'tc52'); return; }
   if (msg.t === 'notes') {
     if (msg.mtu) chunk = Math.max(19, Math.min(msg.mtu - 3, 500) - 1);
     setAlarm(!!msg.alarm);

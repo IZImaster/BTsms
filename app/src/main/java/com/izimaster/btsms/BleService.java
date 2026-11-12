@@ -8,6 +8,7 @@ import android.app.Service;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothGatt;
+import android.bluetooth.BluetoothGattCallback;
 import android.bluetooth.BluetoothGattCharacteristic;
 import android.bluetooth.BluetoothGattDescriptor;
 import android.bluetooth.BluetoothGattServer;
@@ -73,6 +74,8 @@ public class BleService extends Service implements NoteStore.Listener {
         boolean subscribed = false;
         final ByteArrayOutputStream message = new ByteArrayOutputStream();
         final ByteArrayOutputStream prepared = new ByteArrayOutputStream();
+        BluetoothGatt rssiGatt;   // client link back to the laptop, used only to read signal strength
+        Runnable rssiPoll;
     }
 
     private static final class Packet {
@@ -244,6 +247,7 @@ public class BleService extends Service implements NoteStore.Listener {
             if (server != null) server.close();
         } catch (Exception ignored) { }
         server = null;
+        for (Client c : clients.values()) closeRssiLink(c);
         clients.clear();
         devices.clear();
         queue.clear();
@@ -268,9 +272,11 @@ public class BleService extends Service implements NoteStore.Listener {
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
                     clients.put(key, new Client());
                     devices.put(key, device);
-                    // Keep advertising while connected: the laptop page measures signal strength from it.
+                    // Keep advertising while connected (lets the page also measure signal itself).
                     restartAdvertising();
+                    main.postDelayed(() -> openRssiLink(device), 1500);
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    closeRssiLink(clients.get(key));
                     clients.remove(key);
                     devices.remove(key);
                     queue.removeIf(p -> p.device.getAddress().equals(key));
@@ -499,6 +505,72 @@ public class BleService extends Service implements NoteStore.Listener {
             main.post(this::sendNext);
         }
         retries = 0;
+    }
+
+    // ---------------------------------------------------------------- signal strength
+    // A GATT server cannot read RSSI, so we also open a client connection over the same
+    // Bluetooth link to the laptop and poll readRemoteRssi() once a second.
+
+    private void openRssiLink(BluetoothDevice device) {
+        Client c = clients.get(device.getAddress());
+        if (c == null || c.rssiGatt != null || server == null) return;
+        try {
+            c.rssiGatt = device.connectGatt(this, false, rssiCallback, BluetoothDevice.TRANSPORT_LE);
+        } catch (Exception e) {
+            c.rssiGatt = null;
+        }
+    }
+
+    private void closeRssiLink(Client c) {
+        if (c == null) return;
+        if (c.rssiPoll != null) main.removeCallbacks(c.rssiPoll);
+        c.rssiPoll = null;
+        try { if (c.rssiGatt != null) c.rssiGatt.close(); } catch (Exception ignored) { }
+        c.rssiGatt = null;
+    }
+
+    private final BluetoothGattCallback rssiCallback = new BluetoothGattCallback() {
+        @Override
+        public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
+            final BluetoothDevice device = gatt.getDevice();
+            main.post(() -> {
+                Client c = clients.get(device.getAddress());
+                if (c == null || c.rssiGatt != gatt) return;
+                if (newState == BluetoothProfile.STATE_CONNECTED) {
+                    if (c.rssiPoll != null) main.removeCallbacks(c.rssiPoll);
+                    c.rssiPoll = new Runnable() {
+                        @Override
+                        public void run() {
+                            try { gatt.readRemoteRssi(); } catch (Exception ignored) { }
+                            main.postDelayed(this, 1000);
+                        }
+                    };
+                    main.post(c.rssiPoll);
+                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    // client side dropped but laptop may still be connected: try again later
+                    closeRssiLink(c);
+                    main.postDelayed(() -> openRssiLink(device), 5000);
+                }
+            });
+        }
+
+        @Override
+        public void onReadRemoteRssi(BluetoothGatt gatt, int rssi, int status) {
+            if (status != BluetoothGatt.GATT_SUCCESS) return;
+            final BluetoothDevice device = gatt.getDevice();
+            main.post(() -> sendRssi(device, rssi));
+        }
+    };
+
+    private void sendRssi(BluetoothDevice device, int rssi) {
+        Client c = clients.get(device.getAddress());
+        if (c == null || !c.subscribed || queue.size() > 20) return;
+        try {
+            JSONObject msg = new JSONObject();
+            msg.put("t", "rssi");
+            msg.put("v", rssi);
+            sendJson(device, msg);
+        } catch (Exception ignored) { }
     }
 
     // ---------------------------------------------------------------- status
