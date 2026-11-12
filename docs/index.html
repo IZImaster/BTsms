@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BTsms</title>
+<style>
+  :root { --bg:#f8f9fa; --text:#202124; --muted:#5f6368; --blue:#1a73e8; --border:#dadce0; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: "Segoe UI", Roboto, Arial, sans-serif; background:var(--bg); color:var(--text); }
+  header { position:sticky; top:0; z-index:5; display:flex; align-items:center; gap:12px; padding:10px 20px;
+           background:#fff; border-bottom:1px solid var(--border); }
+  header h1 { font-size:22px; margin:0; font-weight:600; }
+  .status { display:flex; align-items:center; gap:6px; font-size:14px; color:var(--muted); }
+  .dot { width:10px; height:10px; border-radius:50%; background:#c5221f; }
+  .dot.on { background:#188038; } .dot.busy { background:#f9ab00; }
+  .spacer { flex:1; }
+  button { font:inherit; font-size:14px; border:1px solid var(--border); background:#fff; color:var(--text);
+           padding:7px 14px; border-radius:8px; cursor:pointer; }
+  button:hover { background:#f1f3f4; }
+  button.primary { background:var(--blue); color:#fff; border-color:var(--blue); }
+  button.primary:hover { background:#1765cc; }
+  button:disabled { opacity:.5; cursor:default; }
+  main { max-width:1200px; margin:0 auto; padding:20px; }
+  .composer { max-width:600px; margin:0 auto 24px; background:#fff; border:1px solid var(--border);
+              border-radius:10px; box-shadow:0 1px 3px rgba(0,0,0,.12); padding:10px 12px; }
+  .composer textarea { width:100%; border:none; outline:none; resize:vertical; min-height:60px;
+                       font:inherit; font-size:15px; }
+  .composer .row { display:flex; justify-content:flex-end; align-items:center; gap:8px; }
+  .hint { font-size:12px; color:var(--muted); margin-right:auto; }
+  .grid { column-width:240px; column-gap:16px; }
+  .card { break-inside:avoid; margin:0 0 16px; border:1px solid rgba(0,0,0,.12); border-radius:10px;
+          padding:12px 14px 6px; transition: box-shadow .2s; }
+  .card:hover { box-shadow:0 1px 6px rgba(0,0,0,.2); }
+  .card .text { white-space:pre-wrap; word-wrap:break-word; font-size:15px; line-height:1.4; }
+  .card .bar { display:flex; align-items:center; gap:2px; margin-top:8px; }
+  .card .time { font-size:12px; color:var(--muted); margin-right:auto; }
+  .card .bar button { border:none; background:transparent; color:var(--blue); padding:5px 8px; font-size:13px; }
+  .card .bar button:hover { background:rgba(0,0,0,.06); }
+  .card .bar button.copy { font-weight:600; }
+  .card textarea { width:100%; min-height:90px; font:inherit; font-size:15px; border:1px solid var(--border);
+                   border-radius:6px; padding:6px; background:rgba(255,255,255,.7); }
+  .card.new { animation: flash 1.5s; }
+  @keyframes flash { 0%{ box-shadow:0 0 0 3px var(--blue);} 100%{ box-shadow:none;} }
+  .empty, .msg { text-align:center; color:var(--muted); margin-top:40px; }
+  .msg.err { color:#c5221f; }
+  .offline .card .bar button:not(.copy) { display:none; }
+  footer { text-align:center; font-size:12px; color:var(--muted); padding:20px; }
+  footer a { color:var(--blue); }
+  #toast { position:fixed; bottom:24px; left:50%; transform:translateX(-50%); background:#323232; color:#fff;
+           padding:10px 18px; border-radius:6px; font-size:14px; opacity:0; transition:opacity .2s; pointer-events:none; }
+  #toast.show { opacity:1; }
+</style>
+</head>
+<body>
+<header>
+  <h1>BTsms</h1>
+  <div class="status"><span id="dot" class="dot"></span><span id="statusText">Not connected</span></div>
+  <div class="spacer"></div>
+  <button id="connectBtn" class="primary">Connect to TC52</button>
+  <button id="disconnectBtn" hidden>Disconnect</button>
+</header>
+
+<main id="main">
+  <div class="composer" id="composer">
+    <textarea id="newText" placeholder="Take a note… (sent to the TC52)"></textarea>
+    <div class="row">
+      <span class="hint">Ctrl+Enter to add</span>
+      <button id="addBtn" class="primary" disabled>Add</button>
+    </div>
+  </div>
+  <div id="message" class="msg"></div>
+  <div id="grid" class="grid"></div>
+</main>
+
+<footer>
+  TC52 app: <a href="https://github.com/IZImaster/BTsms/releases/latest/download/BTsms.apk">download BTsms.apk</a>
+</footer>
+<div id="toast"></div>
+
+<script>
+const SERVICE = '6f1d0001-8c4a-4b6e-9b2e-3a1c5e7d9f01';
+const TX = '6f1d0002-8c4a-4b6e-9b2e-3a1c5e7d9f01'; // TC52 -> laptop (notify)
+const RX = '6f1d0003-8c4a-4b6e-9b2e-3a1c5e7d9f01'; // laptop -> TC52 (write)
+const COLORS = ['#fff8b8','#e2f6d3','#d4e4ed','#f6e2dd','#e9e3d4','#efeff1','#faafa8','#b4ddd3'];
+
+const $ = id => document.getElementById(id);
+let device = null, rx = null, tx = null;
+let chunk = 19;                 // bytes of data per packet (updated from TC52's MTU)
+let inBuf = [];                 // incoming packet bytes
+let notes = [];
+let seen = new Set();
+let firstList = true;
+let editingId = null;
+let manualDisconnect = false;
+let writeChain = Promise.resolve();
+const enc = new TextEncoder(), dec = new TextDecoder();
+
+// ---------- helpers
+function toast(t) {
+  const el = $('toast'); el.textContent = t; el.classList.add('show');
+  clearTimeout(toast.t); toast.t = setTimeout(() => el.classList.remove('show'), 1500);
+}
+function setStatus(text, state) {
+  $('statusText').textContent = text;
+  $('dot').className = 'dot' + (state ? ' ' + state : '');
+}
+function connected() { return !!(device && device.gatt.connected && rx); }
+function updateButtons() {
+  const c = connected();
+  $('connectBtn').hidden = c;
+  $('disconnectBtn').hidden = !c;
+  $('addBtn').disabled = !c;
+  document.body.classList.toggle('offline', !c);
+}
+function colorFor(id) {
+  let h = 0; for (const ch of id) h = (h * 31 + ch.charCodeAt(0)) | 0;
+  return COLORS[Math.abs(h) % COLORS.length];
+}
+function fmt(ts) {
+  const d = new Date(ts);
+  return d.toLocaleDateString(undefined, { day: '2-digit', month: 'short' }) + ' ' +
+         d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+}
+function saveCache() { try { localStorage.setItem('btsms-notes', JSON.stringify(notes)); } catch (e) {} }
+function loadCache() { try { return JSON.parse(localStorage.getItem('btsms-notes') || '[]'); } catch (e) { return []; } }
+
+async function copyText(t) {
+  try { await navigator.clipboard.writeText(t); toast('Copied'); }
+  catch (e) {
+    const ta = document.createElement('textarea'); ta.value = t; document.body.appendChild(ta);
+    ta.select(); document.execCommand('copy'); ta.remove(); toast('Copied');
+  }
+}
+
+// ---------- rendering
+function render() {
+  const grid = $('grid');
+  grid.innerHTML = '';
+  if (!notes.length) {
+    const e = document.createElement('div'); e.className = 'empty';
+    e.textContent = connected() ? 'No notes yet.' : '';
+    grid.appendChild(e); return;
+  }
+  for (const n of notes) {
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.style.background = colorFor(n.id);
+    if (!firstList && !seen.has(n.id)) card.classList.add('new');
+
+    if (editingId === n.id) {
+      const ta = document.createElement('textarea'); ta.value = n.text;
+      const bar = document.createElement('div'); bar.className = 'bar';
+      const sp = document.createElement('span'); sp.className = 'time';
+      const save = btn('Save', () => { send({ t: 'edit', id: n.id, text: ta.value }); editingId = null; render(); });
+      const cancel = btn('Cancel', () => { editingId = null; render(); });
+      ta.addEventListener('keydown', e => { if (e.key === 'Enter' && e.ctrlKey) save.click(); if (e.key === 'Escape') cancel.click(); });
+      bar.append(sp, save, cancel);
+      card.append(ta, bar);
+      setTimeout(() => ta.focus(), 0);
+    } else {
+      const text = document.createElement('div'); text.className = 'text'; text.textContent = n.text;
+      const bar = document.createElement('div'); bar.className = 'bar';
+      const time = document.createElement('span'); time.className = 'time'; time.textContent = fmt(n.ts);
+      const copy = btn('Copy', () => copyText(n.text)); copy.className = 'copy';
+      const edit = btn('Edit', () => { editingId = n.id; render(); });
+      const del = btn('Delete', () => { if (confirm('Delete this note?')) send({ t: 'del', id: n.id }); });
+      bar.append(time, copy, edit, del);
+      card.append(text, bar);
+    }
+    grid.appendChild(card);
+  }
+  for (const n of notes) seen.add(n.id);
+  firstList = false;
+}
+function btn(label, fn) { const b = document.createElement('button'); b.textContent = label; b.onclick = fn; return b; }
+
+// ---------- Bluetooth
+async function connect() {
+  if (!navigator.bluetooth) {
+    $('message').className = 'msg err';
+    $('message').textContent = 'This browser has no Web Bluetooth. Use Google Chrome or Microsoft Edge.';
+    return;
+  }
+  try {
+    device = await navigator.bluetooth.requestDevice({ filters: [{ services: [SERVICE] }] });
+    device.addEventListener('gattserverdisconnected', onDisconnected);
+    await openGatt();
+  } catch (e) {
+    if (e.name !== 'NotFoundError') { setStatus('Connect failed: ' + e.message, ''); }
+  }
+}
+
+async function openGatt() {
+  setStatus('Connecting…', 'busy');
+  const server = await device.gatt.connect();
+  const service = await server.getPrimaryService(SERVICE);
+  tx = await service.getCharacteristic(TX);
+  rx = await service.getCharacteristic(RX);
+  tx.addEventListener('characteristicvaluechanged', onPacket);
+  await tx.startNotifications();
+  inBuf = [];
+  chunk = 19;
+  setStatus('Connected to ' + (device.name || 'TC52'), 'on');
+  $('message').textContent = '';
+  updateButtons();
+  await send({ t: 'sync' });
+}
+
+let retryTimer = null;
+function onDisconnected() {
+  rx = null; tx = null;
+  updateButtons();
+  if (manualDisconnect) { manualDisconnect = false; setStatus('Not connected', ''); return; }
+  let tries = 0;
+  const attempt = async () => {
+    tries++;
+    setStatus('Connection lost – reconnecting (' + tries + ')…', 'busy');
+    try { await openGatt(); }
+    catch (e) {
+      if (tries < 10) retryTimer = setTimeout(attempt, 3000);
+      else setStatus('Disconnected – click Connect', '');
+    }
+  };
+  retryTimer = setTimeout(attempt, 1000);
+}
+
+function disconnect() {
+  clearTimeout(retryTimer);
+  manualDisconnect = true;
+  if (device && device.gatt.connected) device.gatt.disconnect();
+  else { manualDisconnect = false; setStatus('Not connected', ''); updateButtons(); }
+}
+
+function onPacket(ev) {
+  const v = new Uint8Array(ev.target.value.buffer, ev.target.value.byteOffset, ev.target.value.byteLength);
+  if (!v.length) return;
+  for (let i = 1; i < v.length; i++) inBuf.push(v[i]);
+  if (v[0] !== 0) return; // more packets coming
+  const json = dec.decode(new Uint8Array(inBuf));
+  inBuf = [];
+  let msg; try { msg = JSON.parse(json); } catch (e) { return; }
+  if (msg.t === 'notes') {
+    if (msg.mtu) chunk = Math.max(19, Math.min(msg.mtu - 3, 500) - 1);
+    notes = msg.notes || [];
+    saveCache();
+    render();
+  }
+}
+
+function send(obj) {
+  const bytes = enc.encode(JSON.stringify(obj));
+  writeChain = writeChain.then(async () => {
+    if (!connected()) { toast('Not connected'); return; }
+    for (let pos = 0; pos < bytes.length || pos === 0; pos += chunk) {
+      const part = bytes.slice(pos, pos + chunk);
+      const last = pos + chunk >= bytes.length;
+      const pkt = new Uint8Array(part.length + 1);
+      pkt[0] = last ? 0 : 1;
+      pkt.set(part, 1);
+      if (rx.writeValueWithResponse) await rx.writeValueWithResponse(pkt);
+      else await rx.writeValue(pkt);
+      if (last) break;
+    }
+  }).catch(e => toast('Send failed: ' + e.message));
+  return writeChain;
+}
+
+// ---------- UI wiring
+$('connectBtn').onclick = connect;
+$('disconnectBtn').onclick = disconnect;
+$('addBtn').onclick = () => {
+  const t = $('newText').value;
+  if (!t.trim()) return;
+  send({ t: 'add', text: t });
+  $('newText').value = '';
+};
+$('newText').addEventListener('keydown', e => { if (e.key === 'Enter' && e.ctrlKey) $('addBtn').click(); });
+
+notes = loadCache();
+for (const n of notes) seen.add(n.id);
+if (notes.length) $('message').textContent = 'Showing last synced notes (offline). Connect to update.';
+updateButtons();
+render();
+</script>
+</body>
+</html>

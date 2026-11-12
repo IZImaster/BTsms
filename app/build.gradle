@@ -1,0 +1,47 @@
+plugins {
+    id 'com.android.application'
+}
+
+def runNumber = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInteger()
+
+android {
+    namespace 'com.izimaster.btsms'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.izimaster.btsms'
+        minSdk 26
+        targetSdk 34
+        versionCode runNumber
+        versionName "1.0." + runNumber
+    }
+
+    signingConfigs {
+        shared {
+            storeFile file('../keystore/btsms.keystore')
+            storePassword 'btsms123'
+            keyAlias 'btsms'
+            keyPassword 'btsms123'
+        }
+    }
+
+    buildTypes {
+        debug {
+            signingConfig signingConfigs.shared
+        }
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.shared
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    lint {
+        checkReleaseBuilds false
+        abortOnError false
+    }
+}
