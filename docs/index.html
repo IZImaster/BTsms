@@ -22,6 +22,17 @@
   button.primary:hover { background:#1765cc; }
   button:disabled { opacity:.5; cursor:default; }
   button.find { border-color:#f9ab00; font-weight:600; }
+  .lbbar { display:flex; flex-wrap:wrap; align-items:center; gap:8px 16px; padding:8px 20px; background:#fff;
+           border-bottom:1px solid var(--border); font-size:14px; color:var(--muted); }
+  .lbbar input[type=number] { width:64px; font:inherit; padding:3px 5px; border:1px solid var(--border); border-radius:6px; }
+  .lbbar button { padding:4px 10px; font-size:13px; }
+  .sig { display:flex; align-items:center; gap:6px; color:var(--text); min-width:150px; }
+  .bars { display:inline-flex; align-items:flex-end; gap:2px; height:16px; }
+  .bars i { display:block; width:4px; background:#dadce0; border-radius:1px; }
+  .bars i:nth-child(1){height:4px} .bars i:nth-child(2){height:8px} .bars i:nth-child(3){height:12px} .bars i:nth-child(4){height:16px}
+  .bars.good i.on { background:#188038; } .bars.ok i.on { background:#f9ab00; } .bars.bad i.on { background:#d93025; }
+  .sighint { font-size:12px; color:#c5221f; flex-basis:100%; }
+  .sighint:empty { display:none; }
   .toggle { font-size:14px; color:var(--muted); display:flex; align-items:center; gap:5px; cursor:pointer; user-select:none; }
   body.lost header { background:#fce8e6; }
   button.find.ringing { background:#d93025; border-color:#d93025; color:#fff; animation: pulse 1s infinite; }
@@ -62,14 +73,21 @@
   <h1>BTsms</h1>
   <div class="status"><span id="dot" class="dot"></span><span id="statusText">Not connected</span></div>
   <div class="spacer"></div>
-  <label class="toggle" title="Beep on this laptop if the TC52 goes out of range">
-    <input type="checkbox" id="leftBehind"> Left-behind alarm
-  </label>
   <button id="silenceBtn" class="find ringing" hidden>🔕 Silence</button>
   <button id="findBtn" class="find" hidden>🔊 Find TC52</button>
   <button id="connectBtn" class="primary">Connect to TC52</button>
   <button id="disconnectBtn" hidden>Disconnect</button>
 </header>
+<div class="lbbar">
+  <label class="toggle" title="Beep on this laptop when the TC52 gets too far away">
+    <input type="checkbox" id="leftBehind"> Left-behind alarm
+  </label>
+  <span class="sig"><span id="bars" class="bars"><i></i><i></i><i></i><i></i></span> <b id="rssiText">Signal: –</b></span>
+  <label>Alarm when weaker than <input type="number" id="threshold" min="-110" max="-30" step="1"> dBm</label>
+  <label>for <input type="number" id="delay" min="1" max="60" step="1"> s</label>
+  <button id="useCurrent" title="Set the threshold to the signal measured right now">Use current signal</button>
+  <span id="sigHint" class="sighint"></span>
+</div>
 
 <main id="main">
   <div class="composer" id="composer">
@@ -218,6 +236,7 @@ async function openGatt() {
   setStatus('Connected to ' + (device.name || 'TC52'), 'on');
   $('message').textContent = '';
   updateButtons();
+  startSignalWatch();
   await send({ t: 'sync' });
 }
 
@@ -230,7 +249,7 @@ function onDisconnected() {
   reconnecting = true;
   $('disconnectBtn').hidden = false;
   $('disconnectBtn').textContent = 'Stop reconnecting';
-  if ($('leftBehind').checked) lostAlarmStart();
+  if ($('leftBehind').checked) lostAlarmStart('disconnect', 5); // 5 s grace for short hiccups
   let tries = 0;
   const attempt = async () => {
     if (!reconnecting) return;
@@ -250,6 +269,7 @@ function onDisconnected() {
 
 function disconnect() {
   clearTimeout(retryTimer);
+  stopSignalWatch();
   lostAlarmStop();
   if (reconnecting) {
     reconnecting = false;
@@ -281,15 +301,17 @@ function beepBuffer() {
   }
   return buf;
 }
-function lostAlarmStart() {
-  if (lostSource || !audioCtx) return;
+let lostReason = null;
+function lostAlarmStart(reason, delaySec) {
+  if (lostReason || !audioCtx) return;
+  lostReason = reason;
   try {
+    if (audioCtx.state === 'suspended') audioCtx.resume();
     lostSource = audioCtx.createBufferSource();
     lostSource.buffer = beepBuffer();
     lostSource.loop = true;
     lostSource.connect(audioCtx.destination);
-    // 5 s grace period, so a short Bluetooth hiccup does not beep
-    lostSource.start(audioCtx.currentTime + 5);
+    lostSource.start(audioCtx.currentTime + (delaySec || 0));
   } catch (e) { lostSource = null; }
   $('silenceBtn').hidden = false;
   document.body.classList.add('lost');
@@ -299,17 +321,112 @@ function lostAlarmStart() {
 function lostAlarmStop() {
   try { if (lostSource) lostSource.stop(); } catch (e) {}
   lostSource = null;
+  lostReason = null;
   $('silenceBtn').hidden = true;
   document.body.classList.remove('lost');
   clearInterval(titleTimer); document.title = 'BTsms';
 }
-$('silenceBtn').onclick = lostAlarmStop;
-try { $('leftBehind').checked = localStorage.getItem('btsms-leftbehind') !== 'off'; } catch (e) { $('leftBehind').checked = true; }
+$('silenceBtn').onclick = () => { snoozed = true; lostAlarmStop(); };
+
+// ---------- signal strength (measured by Chrome from the TC52's Bluetooth broadcasts)
+let samples = [];          // [time, rssi] from the last 3 seconds
+let lastAdvert = 0;
+let watching = false;
+let weakSince = null;
+let snoozed = false;       // "Silence" pressed: stay quiet until the signal is good again
+let currentRssi = null;
+let watchAbort = null;
+function stopSignalWatch() {
+  try { if (watchAbort) watchAbort.abort(); } catch (e) {}
+  watchAbort = null; watching = false; samples = []; currentRssi = null; lastAdvert = 0; weakSince = null;
+  showSignal(); $('rssiText').textContent = 'Signal: –';
+}
+
+function getSetting(key, def) { try { const v = localStorage.getItem(key); return v === null ? def : v; } catch (e) { return def; } }
+function setSetting(key, v) { try { localStorage.setItem(key, v); } catch (e) {} }
+
+$('leftBehind').checked = getSetting('btsms-leftbehind', 'on') !== 'off';
+$('threshold').value = getSetting('btsms-threshold', '-80');
+$('delay').value = getSetting('btsms-delay', '5');
 $('leftBehind').onchange = () => {
   unlockAudio();
-  try { localStorage.setItem('btsms-leftbehind', $('leftBehind').checked ? 'on' : 'off'); } catch (e) {}
+  setSetting('btsms-leftbehind', $('leftBehind').checked ? 'on' : 'off');
   if (!$('leftBehind').checked) lostAlarmStop();
 };
+$('threshold').onchange = () => { setSetting('btsms-threshold', $('threshold').value); evaluateSignal(); };
+$('delay').onchange = () => { setSetting('btsms-delay', $('delay').value); evaluateSignal(); };
+$('useCurrent').onclick = () => {
+  unlockAudio();
+  if (currentRssi === null) { toast('No signal reading yet'); return; }
+  $('threshold').value = currentRssi;
+  setSetting('btsms-threshold', String(currentRssi));
+  toast('Threshold set to ' + currentRssi + ' dBm');
+};
+
+async function startSignalWatch() {
+  if (watching) return;
+  if (!device.watchAdvertisements) {
+    $('sigHint').textContent = 'Signal strength needs a Chrome setting: open chrome://flags/#enable-experimental-web-platform-features, set it to Enabled, click Relaunch, then Connect again. ' +
+                               '(The alarm still works when the connection fully drops.)';
+    return;
+  }
+  try {
+    if (!device._btsmsListener) { device.addEventListener('advertisementreceived', onAdvert); device._btsmsListener = true; }
+    watchAbort = new AbortController();
+    await device.watchAdvertisements({ signal: watchAbort.signal });
+    watching = true;
+    $('sigHint').textContent = '';
+  } catch (e) {
+    $('sigHint').textContent = 'Could not measure signal: ' + e.message;
+  }
+}
+
+function onAdvert(ev) {
+  if (typeof ev.rssi !== 'number') return;
+  const now = Date.now();
+  lastAdvert = now;
+  samples.push([now, ev.rssi]);
+  samples = samples.filter(s => now - s[0] <= 3000);
+  currentRssi = Math.round(samples.reduce((a, s) => a + s[1], 0) / samples.length);
+  showSignal();
+  evaluateSignal();
+}
+
+function showSignal() {
+  const r = currentRssi;
+  const thr = Number($('threshold').value);
+  const bars = $('bars');
+  const level = r === null ? 0 : r >= -60 ? 4 : r >= -70 ? 3 : r >= -80 ? 2 : r >= -90 ? 1 : 0;
+  [...bars.children].forEach((b, i) => b.classList.toggle('on', i < level));
+  bars.className = 'bars ' + (r === null ? '' : r < thr ? 'bad' : r < thr + 8 ? 'ok' : 'good');
+  $('rssiText').textContent = r === null ? 'Signal: none' : 'Signal: ' + r + ' dBm';
+}
+
+function evaluateSignal() {
+  if (!watching || !lastAdvert) return; // wait for the first reading
+  const now = Date.now();
+  const thr = Number($('threshold').value) || -80;
+  const delay = (Number($('delay').value) || 5) * 1000;
+  const weak = currentRssi === null || currentRssi < thr;
+  if (weak) {
+    if (weakSince === null) weakSince = now;
+    if (now - weakSince >= delay && $('leftBehind').checked && !snoozed) lostAlarmStart('signal', 0);
+  } else if (currentRssi >= thr + 3) {   // small margin so it does not flicker on/off at the limit
+    weakSince = null;
+    snoozed = false;
+    if (lostReason === 'signal') lostAlarmStop();
+  }
+}
+
+// no broadcasts heard for 8 s = TC52 out of range
+setInterval(() => {
+  if (watching && lastAdvert && Date.now() - lastAdvert > 8000 && currentRssi !== null) {
+    currentRssi = null;
+    samples = [];
+    showSignal();
+  }
+  evaluateSignal();
+}, 1000);
 
 function onPacket(ev) {
   const v = new Uint8Array(ev.target.value.buffer, ev.target.value.byteOffset, ev.target.value.byteLength);

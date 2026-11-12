@@ -268,6 +268,8 @@ public class BleService extends Service implements NoteStore.Listener {
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
                     clients.put(key, new Client());
                     devices.put(key, device);
+                    // Keep advertising while connected: the laptop page measures signal strength from it.
+                    restartAdvertising();
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     clients.remove(key);
                     devices.remove(key);
