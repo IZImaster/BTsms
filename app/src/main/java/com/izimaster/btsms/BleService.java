@@ -126,6 +126,7 @@ public class BleService extends Service implements NoteStore.Listener {
     public void onCreate() {
         super.onCreate();
         running = true;
+        instance = this;
         store = NoteStore.get(this);
         store.addListener(this);
         Alarm.addListener(alarmListener);
@@ -144,6 +145,7 @@ public class BleService extends Service implements NoteStore.Listener {
     @Override
     public void onDestroy() {
         running = false;
+        instance = null;
         store.removeListener(this);
         Alarm.removeListener(alarmListener);
         Alarm.stop();
@@ -281,8 +283,6 @@ public class BleService extends Service implements NoteStore.Listener {
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
                     clients.put(key, new Client());
                     devices.put(key, device);
-                    // Keep advertising while connected (lets the page also measure signal itself).
-                    restartAdvertising();
                     main.postDelayed(() -> openRssiLink(device), 1500);
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     closeRssiLink(clients.get(key));
@@ -294,8 +294,8 @@ public class BleService extends Service implements NoteStore.Listener {
                         StatusListener l = statusListener;
                         if (l != null) l.onRssi(0);
                     }
-                    // Some phones stop advertising after a connection; make sure it is on again.
-                    restartAdvertising();
+                    // Make sure advertising is still on. If it is, this does nothing (same address is kept).
+                    ensureAdvertising();
                 }
                 updateConnectedStatus();
             });
@@ -391,11 +391,43 @@ public class BleService extends Service implements NoteStore.Listener {
         } catch (Exception ignored) { }
     }
 
-    private void restartAdvertising() {
-        try {
-            if (advertiser != null) advertiser.stopAdvertising(advertiseCallback);
-        } catch (Exception ignored) { }
-        if (server != null) startAdvertising();
+    private void ensureAdvertising() {
+        if (server != null) startAdvertising(); // "already started" is fine and keeps the address
+    }
+
+    // ---------------------------------------------------------------- pairing
+    // Pairing lets Windows recognise the TC52 even when Android changes its random Bluetooth address.
+
+    public static volatile BleService instance;
+
+    /** Returns a short text for the settings screen. */
+    public String pairWithLaptop() {
+        int asked = 0, already = 0;
+        for (Map.Entry<String, Client> e : clients.entrySet()) {
+            if (!isAuthed(e.getValue())) continue;
+            BluetoothDevice d = devices.get(e.getKey());
+            if (d == null) continue;
+            try {
+                if (d.getBondState() == BluetoothDevice.BOND_BONDED) { already++; continue; }
+                if (d.createBond()) asked++;
+            } catch (Exception ignored) { }
+        }
+        if (asked > 0) return "Pairing started – accept the pairing request on the laptop (Windows notification) and on this TC52.";
+        if (already > 0) return "Already paired with the connected laptop.";
+        return "Connect the laptop page first, then try again.";
+    }
+
+    public String pairState() {
+        for (Map.Entry<String, Client> e : clients.entrySet()) {
+            BluetoothDevice d = devices.get(e.getKey());
+            if (d == null || !isAuthed(e.getValue())) continue;
+            try {
+                int b = d.getBondState();
+                return b == BluetoothDevice.BOND_BONDED ? "Connected laptop: paired ✓"
+                        : b == BluetoothDevice.BOND_BONDING ? "Connected laptop: pairing…" : "Connected laptop: not paired";
+            } catch (Exception ignored) { }
+        }
+        return "No laptop connected";
     }
 
     // ---------------------------------------------------------------- messages in

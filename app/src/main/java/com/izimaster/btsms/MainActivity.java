@@ -343,6 +343,19 @@ public class MainActivity extends Activity implements NoteStore.Listener, BleSer
         shareBtn.setText(BleService.running ? "Stop sharing" : "Start sharing");
         box.addView(shareBtn);
 
+        box.addView(label("Pairing (lets the laptop find this TC52 again after restarts)"));
+        BleService svc = BleService.instance;
+        TextView pairState = label(svc == null ? "Sharing is off" : svc.pairState());
+        box.addView(pairState);
+        Button pairBtn = new Button(this);
+        pairBtn.setText("Pair with connected laptop");
+        pairBtn.setOnClickListener(v -> {
+            BleService s2 = BleService.instance;
+            String r = s2 == null ? "Start sharing first." : s2.pairWithLaptop();
+            pairState.setText(r);
+        });
+        box.addView(pairBtn);
+
         CheckBox boot = new CheckBox(this);
         boot.setText("Start automatically when the TC52 turns on");
         boot.setChecked(Settings.startOnBoot(this));
