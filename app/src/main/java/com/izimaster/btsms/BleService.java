@@ -58,7 +58,12 @@ public class BleService extends Service implements NoteStore.Listener {
     private static final String CHANNEL_ID = "btsms";
 
     // ---- status shown in the app ----
-    public interface StatusListener { void onStatus(String status); }
+    public interface StatusListener {
+        void onStatus(String status);
+        default void onRssi(int rssi) { }
+    }
+
+    public static volatile Integer lastRssi = null;
 
     public static volatile boolean running = false;
     private static volatile String status = "Stopped";
@@ -76,6 +81,8 @@ public class BleService extends Service implements NoteStore.Listener {
         final ByteArrayOutputStream prepared = new ByteArrayOutputStream();
         BluetoothGatt rssiGatt;   // client link back to the laptop, used only to read signal strength
         Runnable rssiPoll;
+        boolean authed = false;
+        String nonce = "";
     }
 
     private static final class Packet {
@@ -91,6 +98,8 @@ public class BleService extends Service implements NoteStore.Listener {
     private final ArrayDeque<Packet> queue = new ArrayDeque<>();
     private boolean sending = false;
     private int retries = 0;
+    private int failedLogins = 0;
+    private long lockedUntil = 0;
     private final Runnable sendWatchdog = () -> { sending = false; sendNext(); };
 
     private BluetoothManager manager;
@@ -280,6 +289,11 @@ public class BleService extends Service implements NoteStore.Listener {
                     clients.remove(key);
                     devices.remove(key);
                     queue.removeIf(p -> p.device.getAddress().equals(key));
+                    if (clients.isEmpty()) {
+                        lastRssi = null;
+                        StatusListener l = statusListener;
+                        if (l != null) l.onRssi(0);
+                    }
                     // Some phones stop advertising after a connection; make sure it is on again.
                     restartAdvertising();
                 }
@@ -395,7 +409,14 @@ public class BleService extends Service implements NoteStore.Listener {
         try {
             JSONObject msg = new JSONObject(json);
             String t = msg.optString("t");
+            if (!t.equals("hi") && !t.equals("auth") && !isAuthed(c)) return; // must log in first
             switch (t) {
+                case "hi":
+                    sendHello(device, c);
+                    break;
+                case "auth":
+                    handleAuth(device, c, msg.optString("h"));
+                    break;
                 case "sync":
                     sendNotes(device);
                     break;
@@ -421,12 +442,62 @@ public class BleService extends Service implements NoteStore.Listener {
         }
     }
 
+    // ---------------------------------------------------------------- password check
+    // The page never sends the password itself: TC52 sends a random "nonce", the page answers
+    // with sha256(nonce + ":" + sha256(password)), and TC52 compares it with its own result.
+
+    private boolean isAuthed(Client c) {
+        return c.authed || !Settings.hasPassword(this);
+    }
+
+    private void sendHello(BluetoothDevice device, Client c) {
+        try {
+            c.nonce = UUID.randomUUID().toString();
+            JSONObject msg = new JSONObject();
+            msg.put("t", "hello");
+            msg.put("auth", Settings.hasPassword(this));
+            msg.put("nonce", c.nonce);
+            msg.put("mtu", c.mtu);
+            sendJson(device, msg);
+        } catch (Exception ignored) { }
+    }
+
+    private void handleAuth(BluetoothDevice device, Client c, String h) {
+        boolean ok;
+        boolean locked = System.currentTimeMillis() < lockedUntil;
+        if (!Settings.hasPassword(this)) ok = true;
+        else if (locked || c.nonce.isEmpty()) ok = false;
+        else ok = Settings.sha256(c.nonce + ":" + Settings.passwordHash(this)).equals(h);
+        c.nonce = ""; // one use only
+        try {
+            JSONObject msg = new JSONObject();
+            msg.put("t", "auth");
+            msg.put("ok", ok);
+            if (locked) msg.put("locked", true);
+            sendJson(device, msg);
+        } catch (Exception ignored) { }
+        if (ok) {
+            c.authed = true;
+            failedLogins = 0;
+            sendNotes(device);
+            updateConnectedStatus();
+        } else {
+            if (!locked && ++failedLogins >= 5) {
+                lockedUntil = System.currentTimeMillis() + 60_000; // 1 minute lockout after 5 wrong tries
+                failedLogins = 0;
+            }
+            main.postDelayed(() -> {
+                try { if (server != null) server.cancelConnection(device); } catch (Exception ignored) { }
+            }, 800);
+        }
+    }
+
     // ---------------------------------------------------------------- messages out
 
     @Override
     public void onNotesChanged() {
         for (Map.Entry<String, Client> e : clients.entrySet()) {
-            if (e.getValue().subscribed) {
+            if (e.getValue().subscribed && isAuthed(e.getValue())) {
                 BluetoothDevice d = devices.get(e.getKey());
                 if (d != null) sendNotes(d);
             }
@@ -448,7 +519,7 @@ public class BleService extends Service implements NoteStore.Listener {
 
     private void sendAlarmState(boolean on) {
         for (Map.Entry<String, Client> e : clients.entrySet()) {
-            if (!e.getValue().subscribed) continue;
+            if (!e.getValue().subscribed || !isAuthed(e.getValue())) continue;
             BluetoothDevice d = devices.get(e.getKey());
             if (d == null) continue;
             try {
@@ -558,13 +629,18 @@ public class BleService extends Service implements NoteStore.Listener {
         public void onReadRemoteRssi(BluetoothGatt gatt, int rssi, int status) {
             if (status != BluetoothGatt.GATT_SUCCESS) return;
             final BluetoothDevice device = gatt.getDevice();
-            main.post(() -> sendRssi(device, rssi));
+            main.post(() -> {
+                lastRssi = rssi;
+                StatusListener l = statusListener;
+                if (l != null) l.onRssi(rssi);
+                sendRssi(device, rssi);
+            });
         }
     };
 
     private void sendRssi(BluetoothDevice device, int rssi) {
         Client c = clients.get(device.getAddress());
-        if (c == null || !c.subscribed || queue.size() > 20) return;
+        if (c == null || !c.subscribed || !isAuthed(c) || queue.size() > 20) return;
         try {
             JSONObject msg = new JSONObject();
             msg.put("t", "rssi");
@@ -576,9 +652,12 @@ public class BleService extends Service implements NoteStore.Listener {
     // ---------------------------------------------------------------- status
 
     private void updateConnectedStatus() {
-        int n = clients.size();
         if (server == null) return;
-        setStatus(n == 0 ? "Waiting for laptop…" : "Laptop connected" + (n > 1 ? " (" + n + ")" : ""));
+        int n = 0;
+        for (Client c : clients.values()) if (isAuthed(c)) n++;
+        if (n > 0) setStatus("Laptop connected" + (n > 1 ? " (" + n + ")" : ""));
+        else if (!clients.isEmpty()) setStatus("Waiting for laptop… (login in progress)");
+        else setStatus("Waiting for laptop…");
     }
 
     private void setStatus(String s) {

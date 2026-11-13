@@ -45,7 +45,7 @@ public final class NoteStore {
     }
 
     private NoteStore(Context ctx) {
-        prefs = ctx.getSharedPreferences("btsms", Context.MODE_PRIVATE);
+        prefs = Settings.storage(ctx).getSharedPreferences("btsms", Context.MODE_PRIVATE);
         try {
             JSONArray arr = new JSONArray(prefs.getString("notes", "[]"));
             for (int i = 0; i < arr.length(); i++) {
