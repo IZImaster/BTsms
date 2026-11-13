@@ -236,11 +236,13 @@ let keepTrying = false;      // automatic reconnecting is active
 let connecting = false;
 let manualDisconnect = false;
 let retryTimer = null;
+let failCount = 0;
 let chunk = 19, inBuf = [];
 let writeChain = Promise.resolve();
 
 function updateButtons() {
-  $('connectBtn').hidden = ready || keepTrying;
+  $('connectBtn').hidden = ready;
+  $('connectBtn').textContent = !device ? 'Connect to TC52' : keepTrying ? 'Choose TC52 again' : 'Connect';
   $('disconnectBtn').hidden = !(ready || keepTrying);
   $('disconnectBtn').textContent = ready ? 'Disconnect' : 'Stop searching';
   $('addBtn').disabled = !ready;
@@ -259,11 +261,14 @@ function useDevice(d) {
 
 async function connectClick() {
   unlockAudio();
+  if (device && !keepTrying) { startTrying(); return; }   // reconnect to the chosen TC52, no popup
   if (!navigator.bluetooth) { banner('This browser has no Web Bluetooth. Use Google Chrome or Microsoft Edge.', true); return; }
   try {
     const d = await navigator.bluetooth.requestDevice({ filters: [{ services: [SERVICE] }] });
     useDevice(d);
+    failCount = 0;
     startTrying();
+    if (!connecting) tryConnect();
   } catch (e) {
     if (e.name !== 'NotFoundError') setStatus('Connect failed: ' + e.message, '');
   }
@@ -285,6 +290,8 @@ async function tryConnect() {
     await withTimeout(openGatt(), 20000);
   } catch (e) {
     try { if (device.gatt.connected) device.gatt.disconnect(); } catch (_) {}
+    if (++failCount === 15 && keepTrying) banner('Still can\'t reach the TC52. If its sharing was stopped/restarted or it was switched off, ' +
+      'Chrome may no longer recognise it: click "Choose TC52 again". To avoid this, pair once: TC52 ⚙ Settings → "Pair with connected laptop".');
     if (keepTrying) setStatus((S.findOn ? 'Searching for TC52' : 'TC52 not in range') + ' – trying again…', 'busy');
   }
   connecting = false;
@@ -323,6 +330,7 @@ function loggedIn() {
   ready = true;
   if (helloWaiter) { helloWaiter.res(); helloWaiter = null; }
   setStatus('Connected to ' + (device.name || 'TC52'), 'on');
+  failCount = 0;
   banner(''); updateFindBanner();
   findTriggered = false;
   if (lostReason === 'disconnect') lostAlarmStop();
